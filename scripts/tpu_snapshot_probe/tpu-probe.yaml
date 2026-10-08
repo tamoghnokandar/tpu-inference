@@ -1,0 +1,87 @@
+# Phase 0 snapshot probe VM: a Spot tpu-v6e-8 prepared for gVisor + libtpu checkpointing.
+# Launch two (source + target) from this directory:
+#   sky launch -c probe-a -i 600 --down tpu-probe.yaml
+#   sky launch -c probe-b -i 600 --down tpu-probe.yaml
+# SkyPilot counts SSH-only work as idle, so keep the idle timeout generous and run
+# `sky down probe-a probe-b` when finished.
+name: tpu-probe
+resources:
+  infra: gcp/asia-south1
+  accelerators: tpu-v6e-8
+  accelerator_args:
+    runtime_version: v2-alpha-tpuv6e
+  use_spot: true
+  disk_size: 512   # not applied to the TPU VM boot disk (stays 97 GB); staging uses RAM disks below
+workdir: .
+envs:
+  DOCKER_URI: vllm/vllm-tpu:gemma4
+setup: |
+  set -euxo pipefail
+  W=~/sky_workdir
+  sudo mkdir -p /opt/probe && sudo cp $W/probe.py /opt/probe/probe.py
+
+  if ! command -v docker >/dev/null; then
+    sudo apt-get update && sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io
+  fi
+  command -v zstd >/dev/null || sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y zstd
+  command -v bc >/dev/null || sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y bc
+  sudo systemctl enable --now docker
+  sudo docker pull "$DOCKER_URI"
+
+  # gVisor master build. Source and target must run the *same* runsc binary: if the
+  # two VMs pick up different master builds, copy one VM's /usr/local/bin/runsc and
+  # /usr/local/bin/gvisor-bin to the other.
+  ARCH=$(uname -m); URL=https://storage.googleapis.com/gvisor/releases/master/latest/${ARCH}
+  cd /tmp && rm -f gvisor.tar.zstd* && wget -q ${URL}/gvisor.tar.zstd ${URL}/gvisor.tar.zstd.sha512
+  sha512sum -c gvisor.tar.zstd.sha512 && sudo tar --zstd -xf gvisor.tar.zstd -C /usr/local/bin
+  # runsc-tpu: gVisor netstack (sockets are saved/restored). Do not use --network=host:
+  # host sockets cannot be checkpointed and vLLM's gloo listener aborts on restore.
+  sudo /usr/local/bin/runsc install --runtime=runsc-tpu -- --tpuproxy --debug --debug-log=/tmp/runsc/
+  sudo python3 -c "import json;p='/etc/docker/daemon.json';d=json.load(open(p));d['experimental']=True;json.dump(d,open(p,'w'),indent=2)"
+
+  # gVisor workarounds on TPU VMs
+  [ -d /dev/vfio/devices ] && sudo mv /dev/vfio/devices /dev/vfio-devices.hidden || true  # runsc treats it as an IOMMU group
+  sudo sysctl -w vm.max_map_count=4194304                                                 # XLA compile under gVisor needs many mappings
+
+  # RAM disks: weights, snapshots, containerd scratch (docker restore copies the image twice), XLA cache
+  for m in hf30:200g snap:500g ctrd:400g xla:20g; do d=/mnt/${m%%:*}; sudo mkdir -p $d; mountpoint -q $d || sudo mount -t tmpfs -o size=${m##*:} tmpfs $d; done
+  sudo chmod 777 /mnt/snap; sudo mkdir -p /mnt/ctrd/tmp /mnt/ctrd/content && sudo chmod 1777 /mnt/ctrd/tmp
+  C=/var/lib/containerd/io.containerd.content.v1.content
+  sudo systemctl stop docker docker.socket containerd
+  mountpoint -q $C || { sudo cp -a $C/. /mnt/ctrd/content/; sudo mount --bind /mnt/ctrd/content $C; }
+  sudo mkdir -p /etc/systemd/system/containerd.service.d
+  printf "[Service]\nEnvironment=TMPDIR=/mnt/ctrd/tmp\n" | sudo tee /etc/systemd/system/containerd.service.d/tmpdir.conf >/dev/null
+  sudo systemctl daemon-reload && sudo systemctl start containerd docker
+  # Google's TPU agents (incl. vbar_control_agent on :8353) restart with docker
+  for i in $(seq 1 30); do [ "$(sudo docker ps --format '{{.Names}}' | grep -cE 'vbarcontrolagent|tpu-runtime')" -ge 2 ] && break; sleep 5; done
+
+  # tpucheckpoint (not on gVisor's go branch: copy its source from master)
+  if [ ! -x /usr/local/go/bin/go ]; then
+    GO_VER=$(curl -s 'https://go.dev/VERSION?m=text' | head -1)
+    wget -q https://go.dev/dl/${GO_VER}.linux-amd64.tar.gz && sudo tar -C /usr/local -xzf ${GO_VER}.linux-amd64.tar.gz
+  fi
+  [ -d ~/gvisor ] || git clone --depth 1 -b go https://github.com/google/gvisor.git ~/gvisor
+  rm -rf ~/gv-master && git clone -q --depth 1 --filter=blob:none --sparse https://github.com/google/gvisor.git ~/gv-master
+  (cd ~/gv-master && git sparse-checkout set tools/tpucheckpoint) && cp -r ~/gv-master/tools/tpucheckpoint ~/gvisor/tools/
+  (cd ~/gvisor && /usr/local/go/bin/go build -o ~/tpucheckpoint ./tools/tpucheckpoint)
+
+  # libtpu 0.0.49 (first releases with the checkpoint protocol are 0.0.48+):
+  #  - a venv for probe.py (with JAX 0.11.2)
+  #  - a vLLM image with libtpu swapped in (vLLM 0.17.2 / JAX 0.9.2 worked with it)
+  sudo docker run --rm --entrypoint bash -v /opt/probe:/probe "$DOCKER_URI" -c \
+    "[ -x /probe/v49/bin/python ] || (python3 -m venv /probe/v49 && /probe/v49/bin/pip -q install jax==0.11.2 jaxlib==0.11.2 libtpu==0.0.49 numpy)"
+  mkdir -p ~/img && printf "FROM vllm/vllm-tpu:gemma4\nRUN pip install -q --no-deps libtpu==0.0.49\n" > ~/img/Dockerfile
+  sudo docker build -q -t vllm-tpu:gemma4-l49 ~/img
+  # The restored container must use the same image digest as the source: copy the
+  # source VM's image to the target (docker save | ssh ... docker load) rather than
+  # relying on two independent builds.
+
+  # Model weights (ungated; no HF token needed)
+  sudo docker run --rm --network host -v /mnt/hf30:/hf -e HF_HOME=/hf --entrypoint python3 "$DOCKER_URI" -c \
+    "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-30B-A3B', allow_patterns=['*.json','*.safetensors','*.txt','*.model','tokenizer*'])"
+
+  # VM-to-VM transfer key (append probe-a's ~/.ssh/xfer.pub to probe-b's authorized_keys)
+  [ -f ~/.ssh/xfer ] || ssh-keygen -q -t ed25519 -N "" -f ~/.ssh/xfer
+  chmod +x $W/*.sh
+  runsc --version | head -1
+  echo PROBE_SETUP_COMPLETE
