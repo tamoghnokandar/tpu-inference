@@ -78,7 +78,6 @@ have not been run in this exact form, so expect small fixes on first use.
 
 | File | What it does |
 | --- | --- |
-| `README.md` | Run order and what each workaround is for. |
 | `tpu-probe.yaml` | SkyPilot setup for one probe VM: installs Docker and gVisor, registers the `runsc-tpu` runtime, applies the host fixes, builds `tpucheckpoint`, builds a vLLM image with libtpu 0.0.49, downloads the model, creates RAM disks for snapshots and Docker scratch space. |
 | `common.sh` | Shared settings sourced by the other scripts: image, model, environment variables, TPU devices, `runsc` flags. Keeps both VMs' containers identical. |
 | `probe.py` | Small JAX program that fills TPU memory with known data and checks it every 5 s. Stops TPU work while `/probe/PAUSE` exists. |
@@ -90,6 +89,31 @@ have not been run in this exact form, so expect small fixes on first use.
 | `stage2_checkpoint.sh` | Check vLLM is paused, run `runsc checkpoint`, copy the snapshot to the target VM. |
 | `stage3_restore.sh` | Restore on the target VM, wait for libtpu's restore success, resume vLLM. |
 | `stage4_verify.sh` | Wait for all requests to finish and compare with the snapshot-time state. |
+
+### How to run
+
+```bash
+cd scripts/tpu_snapshot_probe
+sky launch -c probe-a -i 600 --down tpu-probe.yaml   # source VM
+sky launch -c probe-b -i 600 --down tpu-probe.yaml   # target VM
+```
+
+Make the VMs match: same `runsc --version` (copy `/usr/local/bin/runsc` and
+`/usr/local/bin/gvisor-bin/` if not), same image (`docker save vllm-tpu:gemma4-l49 | ssh <probe-b> sudo docker load`),
+and add probe-a's `~/.ssh/xfer.pub` to probe-b's `~/.ssh/authorized_keys`.
+
+```bash
+# on probe-a, in ~/sky_workdir
+./start_vllm.sh
+./stage1_pause.sh
+./stage2_checkpoint.sh <probe-b internal IP>
+# on probe-b, in ~/sky_workdir
+./stage3_restore.sh
+./stage4_verify.sh
+```
+
+Run long steps with `nohup ... &`, because SSH to busy TPU VMs can drop. Tear down with
+`sky down probe-a probe-b`.
 
 ## Not done yet
 
